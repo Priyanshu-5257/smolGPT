@@ -1,22 +1,27 @@
 from model import GPT
-from config import GPTConfig, TrainingConfig
+from config import GPTConfig, TrainingConfig, TrainConfigs
 from functools import partial
 import time
 import math
 import os
 import torch
-from torch.utils.tensorboard.writer import SummaryWriter
+import wandb
+from tqdm import tqdm
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import Task
 from tokenizer import Tokenizer
 
-train_config = TrainingConfig()
+model_size = os.getenv("MODEL_SIZE")
+if model_size:
+    gpt_config, train_config = TrainConfigs.for_model_size(model_size)
+else:
+    gpt_config, train_config = GPTConfig(), TrainingConfig()
+
 out_dir = "out/"
-writer = SummaryWriter(log_dir=os.path.join(out_dir, "logs"))
-resume = True
+resume = False
 ddp = int(os.environ.get("RANK", -1)) != -1
-tokenizer = Tokenizer(f"data/tok{GPTConfig.vocab_size}.model")
+tokenizer = Tokenizer(f"data/tok{gpt_config.vocab_size}.model")
 
 if ddp:
     init_process_group(backend="nccl")
@@ -37,11 +42,13 @@ else:
 tokens_per_iter = (
     train_config.gradient_accumulation_steps
     * train_config.batch_size
-    * GPTConfig.block_size
+    * gpt_config.block_size
     * ddp_world_size
 )
 if master_process:
     print("Tokens per iteration: ", tokens_per_iter)
+    if model_size:
+        print(f"Using model preset: {model_size.lower()}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -49,22 +56,52 @@ torch.manual_seed(42 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
-ctx = torch.autocast(train_config.device, dtype=torch.bfloat16)
+
+# Select dtype for mixed precision
+if train_config.dtype == "float16":
+    dtype = torch.float16
+    scaler_enabled = True
+elif train_config.dtype == "bfloat16":
+    dtype = torch.bfloat16
+    scaler_enabled = False  # BF16 doesn't need GradScaler (has its own loss scaling)
+else:
+    dtype = torch.float32
+    scaler_enabled = False
+
+ctx = torch.autocast(train_config.device, dtype=dtype)
+if master_process:
+    print(f"Using dtype: {train_config.dtype}, GradScaler: {scaler_enabled}")
 
 model_args = dict(
-    n_layer=GPTConfig.n_layer,
-    n_head=GPTConfig.n_head,
-    n_embed=GPTConfig.n_embed,
-    block_size=GPTConfig.block_size,
-    bias=GPTConfig.bias,
-    vocab_size=GPTConfig.vocab_size,
-    dropout=GPTConfig.dropout,
+    n_layer=gpt_config.n_layer,
+    n_head=gpt_config.n_head,
+    n_kv_head=gpt_config.n_kv_head,
+    n_embed=gpt_config.n_embed,
+    block_size=gpt_config.block_size,
+    bias=gpt_config.bias,
+    vocab_size=gpt_config.vocab_size,
+    dropout=gpt_config.dropout,
+    use_rotary=gpt_config.use_rotary,
+    use_qk_norm=gpt_config.use_qk_norm,
+    use_gradient_checkpointing=gpt_config.use_gradient_checkpointing,
 )
+
+if master_process:
+    wandb.init(
+        project=os.getenv("WANDB_PROJECT", "smolGPT"),
+        name=os.getenv("WANDB_RUN_NAME"),
+        config={
+            "model": model_args,
+            "training": vars(train_config),
+            "tokens_per_iter": tokens_per_iter,
+        },
+        dir=out_dir,
+    )
 
 iter_batches = partial(
     Task.iter_batches,
     batch_size=train_config.batch_size,
-    max_seq_len=GPTConfig.block_size,
+    max_seq_len=gpt_config.block_size,
     device=train_config.device,
     num_workers=0,
 )
@@ -89,12 +126,13 @@ else:
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf).to(train_config.device)
 
-scaler = torch.GradScaler(enabled=(train_config.dtype == "float16"))
+scaler = torch.GradScaler(enabled=scaler_enabled)
 optimizer = model.configure_optimizers(
     train_config.weight_decay,
     train_config.learning_rate,
     (train_config.beta1, train_config.beta2),
     train_config.device,
+    optimizer_offload=train_config.optimizer_offload,
 )
 
 if train_config.compile:
@@ -103,6 +141,7 @@ if train_config.compile:
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+
 
 @torch.no_grad()
 def estimate_loss():
@@ -145,19 +184,45 @@ X, Y = next(train_batch_iter)
 iter_num = 0
 raw_model = model.module if ddp else model
 t0 = time.time()
+total_steps = train_config.max_iters + 1
+pbar = (
+    tqdm(total=total_steps, desc="Training", dynamic_ncols=True)
+    if master_process
+    else None
+)
+
+
+def log_message(msg):
+    if not master_process:
+        return
+    if pbar is not None:
+        pbar.write(msg)
+    else:
+        print(msg)
+
+
 while True:
     lr = get_lr(iter_num) if train_config.decay_lr else train_config.learning_rate
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
 
-    if iter_num % train_config.eval_interval == 0 and master_process:
+    if (
+        iter_num >= train_config.eval_start_iter
+        and iter_num % train_config.eval_interval == 0
+        and master_process
+    ):
         losses = estimate_loss()
-        print(
+        log_message(
             f"step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}"
         )
-        writer.add_scalar("train_loss", losses["train"], iter_num)
-        writer.add_scalar("val_loss", losses["val"], iter_num)
-        writer.add_scalar("lr", lr, iter_num)
+        wandb.log(
+            {
+                "train_loss": float(losses["train"]),
+                "val_loss": float(losses["val"]),
+                "lr": lr,
+            },
+            step=iter_num,
+        )
 
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
@@ -167,21 +232,25 @@ while True:
                 "iter_num": iter_num,
                 "best_val_loss": best_val_loss,
             }
-            print(f"Saving checkpoint to {out_dir}")
+            log_message(f"Saving checkpoint to {out_dir}")
             torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
         model.eval()
         prompt = "Once upon a time"
         idxs = tokenizer.encode(prompt, bos=True, eos=False)
-        x = torch.tensor(
-            idxs, dtype=torch.long, device=train_config.device
-        ).unsqueeze(0)
+        x = torch.tensor(idxs, dtype=torch.long, device=train_config.device).unsqueeze(
+            0
+        )
         y = model.generate(x, max_new_tokens=256, temperature=1.0, top_p=0.90)
-        print("===\n\nGenerated Story:\n\n" + tokenizer.decode(y[0].tolist()) + "\n\n===")
+        log_message(
+            "===\n\nGenerated Story:\n\n" + tokenizer.decode(y[0].tolist()) + "\n\n==="
+        )
         model.train()
 
     for micro_step in range(train_config.gradient_accumulation_steps):
         if ddp:
-            model.require_backward_grad_sync = micro_step == train_config.gradient_accumulation_steps - 1 
+            model.require_backward_grad_sync = (
+                micro_step == train_config.gradient_accumulation_steps - 1
+            )
         with ctx:
             logits, loss = model(X, Y)
             loss = loss / train_config.gradient_accumulation_steps
@@ -199,9 +268,29 @@ while True:
     dt = t1 - t0
     t0 = t1
 
+    lossf = loss.item() * train_config.gradient_accumulation_steps
+
+    if pbar is not None:
+        pbar.update(1)
+        pbar.set_postfix(
+            {
+                "step": iter_num,
+                "loss": f"{lossf:.4f}",
+                "lr": f"{lr:.2e}",
+                "ms/it": f"{dt * 1000:.1f}",
+            }
+        )
+
     if iter_num % train_config.log_interval == 0 and master_process:
-        lossf = loss.item() * train_config.gradient_accumulation_steps
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+        wandb.log(
+            {
+                "iter_loss": lossf,
+                "iter_time_ms": dt * 1000.0,
+                "lr": lr,
+            },
+            step=iter_num,
+        )
+        log_message(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms")
 
     iter_num += 1
 
@@ -211,5 +300,7 @@ while True:
 
 if ddp:
     destroy_process_group()
-writer.close()
-
+if pbar is not None:
+    pbar.close()
+if master_process:
+    wandb.finish()

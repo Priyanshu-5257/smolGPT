@@ -2,13 +2,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 import inspect
 
 from config import GPTConfig
 
 
 class Rotary(torch.nn.Module):
-
     def __init__(self, dim, base=10_000):
         super().__init__()
         self.dim = dim
@@ -44,16 +44,72 @@ class Rotary(torch.nn.Module):
         return torch.cat([y1, y2], 3).type_as(x)
 
 
+class ALiBi(torch.nn.Module):
+    def __init__(self, n_head):
+        super().__init__()
+        self.n_head = n_head
+        self.alibi_bias = None
+        self.seq_len_cached = None
+
+    def forward(self, attn_weights, seq_len):
+        if self.seq_len_cached != seq_len:
+            self._create_alibi_bias(seq_len)
+            self.seq_len_cached = seq_len
+
+        return attn_weights + self.alibi_bias[:, :, :seq_len, :seq_len]
+
+    def _create_alibi_bias(self, seq_len):
+        start = 2 ** (-8.0 / self.n_head)
+        slopes = torch.tensor(
+            [start**i for i in range(self.n_head)], dtype=torch.float32
+        )
+
+        positions = torch.arange(seq_len)
+        distance_matrix = (
+            (positions.unsqueeze(0) - positions.unsqueeze(1)).abs().float()
+        )
+
+        alibi = -slopes.view(-1, 1, 1) * distance_matrix.unsqueeze(0).unsqueeze(0)
+
+        self.register_buffer("alibi_bias", alibi.unsqueeze(0), persistent=False)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
         assert config.n_embed % config.n_head == 0
+        assert (
+            config.n_head % config.n_kv_head == 0
+        )  # Q heads must be divisible by KV heads
         self.head_dim = config.n_embed // config.n_head
-        self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed, bias=config.bias)
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_rep_kv = (
+            self.n_head // self.n_kv_head
+        )  # How many Q groups share each KV head
+
+        # GQA: Separate projections for Q, K, V
+        # Q: n_head * head_dim, K/V: n_kv_head * head_dim
+        self.c_q = nn.Linear(
+            config.n_embed, config.n_head * self.head_dim, bias=config.bias
+        )
+        self.c_k = nn.Linear(
+            config.n_embed, config.n_kv_head * self.head_dim, bias=config.bias
+        )
+        self.c_v = nn.Linear(
+            config.n_embed, config.n_kv_head * self.head_dim, bias=config.bias
+        )
         self.c_proj = nn.Linear(config.n_embed, config.n_embed, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.use_exclusive_self_attention = config.use_exclusive_self_attention
+
+        # QK-Norm: Learnable normalization for query and key
+        if config.use_qk_norm:
+            self.q_norm = nn.RMSNorm(self.head_dim)
+            self.k_norm = nn.RMSNorm(self.head_dim)
 
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
 
@@ -69,13 +125,42 @@ class CausalSelfAttention(nn.Module):
         if config.use_rotary:
             self.rotary = Rotary(self.head_dim)
 
+        if config.use_alibi:
+            self.alibi = ALiBi(self.n_head)
+
+        if self.use_exclusive_self_attention:
+            gate_hidden_dim = max(1, self.head_dim // 2)
+            self.exclusive_gate = nn.Sequential(
+                nn.Linear(self.head_dim * 2, gate_hidden_dim, bias=True),
+                nn.GELU(),
+                nn.Linear(gate_hidden_dim, 1, bias=True),
+                nn.Sigmoid(),
+            )
+
     def forward(self, x):
         B, T, C = x.shape
 
-        q, k, v = self.c_attn(x).split(self.config.n_embed, dim=2)
-        q = q.view(B, T, self.config.n_head, C // self.config.n_head).transpose(1, 2)
-        k = k.view(B, T, self.config.n_head, C // self.config.n_head).transpose(1, 2)
-        v = v.view(B, T, self.config.n_head, C // self.config.n_head).transpose(1, 2)
+        # Generate Q, K, V with separate linear layers (GQA)
+        q = self.c_q(x)
+        k = self.c_k(x)
+        v = self.c_v(x)
+
+        # Reshape: Q -> (B, T, n_head, head_dim)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        # Reshape: K, V -> (B, T, n_kv_head, head_dim)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+        # Apply QK-Norm if enabled
+        if self.config.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        # GQA: Expand KV to match number of Q heads
+        # k, v: (B, n_kv_head, T, head_dim) -> (B, n_head, T, head_dim)
+        if self.n_rep_kv > 1:
+            k = k.repeat_interleave(self.n_rep_kv, dim=1)
+            v = v.repeat_interleave(self.n_rep_kv, dim=1)
 
         # Apply rotary embeddings if enabled
         if self.config.use_rotary:
@@ -94,11 +179,28 @@ class CausalSelfAttention(nn.Module):
             attn_pattern = (q @ k.transpose(-2, -1)) * (
                 1.0 / math.sqrt(k.shape[-1])
             )  # B, nh, T, T
+
+            # Apply causal mask
             attn_pattern = attn_pattern.masked_fill(
                 self.bias[:, :, :T, :T] == 0, float("-inf")
             )
+
+            # Apply ALiBi if enabled (not compatible with Flash)
+            if self.config.use_alibi:
+                attn_pattern = self.alibi(attn_pattern, T)
+
             attn = F.softmax(attn_pattern, dim=-1)
+            attn = self.attn_dropout(attn)
             y = attn @ v  # B, nh, T, T @ B, nh, T, hs -> B, nh, T, hs
+
+        if self.use_exclusive_self_attention:
+            dot_product = torch.sum(y * v, dim=-1, keepdim=True)
+            v_norm_sq = torch.sum(v * v, dim=-1, keepdim=True)
+            component = (
+                dot_product / (v_norm_sq + self.config.exclusive_self_attention_eps)
+            ) * v
+            alpha = self.exclusive_gate(torch.cat([q, y], dim=-1))
+            y = y - alpha * component
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -121,21 +223,37 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, use_gradient_checkpointing=False):
         super().__init__()
         self.ln_1 = nn.RMSNorm(config.n_embed)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.RMSNorm(config.n_embed)
         self.ffd = FeedForward(config)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.ffd(self.ln_2(x))
+        if self.use_gradient_checkpointing:
+            # Memory-efficient: recompute forward during backward
+            x = x + torch.utils.checkpoint.checkpoint(
+                self._attn_wrapper, self.ln_1(x), use_reentrant=False
+            )
+            x = x + torch.utils.checkpoint.checkpoint(
+                self._ffn_wrapper, self.ln_2(x), use_reentrant=False
+            )
+        else:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.ffd(self.ln_2(x))
         return x
+
+    def _attn_wrapper(self, x):
+        return self.attn(x)
+
+    def _ffn_wrapper(self, x):
+        return self.ffd(x)
 
 
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, use_gradient_checkpointing=False):
         super().__init__()
         self.config = config
 
@@ -143,12 +261,17 @@ class GPT(nn.Module):
         transformer_dict = {
             "wte": nn.Embedding(config.vocab_size, config.n_embed),
             "drop": nn.Dropout(config.dropout),
-            "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            "h": nn.ModuleList(
+                [
+                    Block(config, config.use_gradient_checkpointing)
+                    for _ in range(config.n_layer)
+                ]
+            ),
             "ln_f": nn.RMSNorm(config.n_embed),
         }
 
-        # Only add positional embeddings if not using rotary
-        if not config.use_rotary:
+        # Only add positional embeddings if not using rotary or ALiBi
+        if not config.use_rotary and not config.use_alibi:
             transformer_dict["wpe"] = nn.Embedding(config.block_size, config.n_embed)
 
         self.transformer = nn.ModuleDict(transformer_dict)
@@ -176,8 +299,8 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         x = self.transformer.wte(idx)
 
-        # Add learnable positional embeddings
-        if not self.config.use_rotary:
+        # Add learnable positional embeddings (only when NOT using RoPE or ALiBi)
+        if not self.config.use_rotary and not self.config.use_alibi:
             device = idx.device
             b, t = idx.shape
             pos_emb = self.transformer.wpe(
@@ -199,7 +322,9 @@ class GPT(nn.Module):
             loss = None
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(
+        self, weight_decay, learning_rate, betas, device_type, optimizer_offload=False
+    ):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
@@ -225,6 +350,15 @@ class GPT(nn.Module):
             optim_groups, lr=learning_rate, betas=betas, **extra_args
         )
         print(f"using fused AdamW: {use_fused}")
+
+        if optimizer_offload:
+            # Move optimizer states to CPU to save VRAM
+            # This adds slight overhead but can save ~30% VRAM
+            print("Enabling optimizer CPU offload")
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to("cpu")
 
         return optimizer
 
