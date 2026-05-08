@@ -6,10 +6,7 @@ import time
 import math
 import os
 import torch
-try:
-    import wandb
-except ModuleNotFoundError:
-    wandb = None
+import wandb
 from tqdm import tqdm
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -98,7 +95,7 @@ model_args = dict(
     shared_mlp_init_zero=gpt_config.shared_mlp_init_zero,
 )
 
-if master_process and wandb is not None:
+if master_process:
     wandb.init(
         project=os.getenv("WANDB_PROJECT", "smolGPT"),
         name=os.getenv("WANDB_RUN_NAME"),
@@ -230,15 +227,14 @@ while True:
         log_message(
             f"step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}"
         )
-        if wandb is not None:
-            wandb.log(
-                {
-                    "train_loss": float(losses["train"]),
-                    "val_loss": float(losses["val"]),
-                    "lr": lr,
-                },
-                step=iter_num,
-            )
+        wandb.log(
+            {
+                "train_loss": float(losses["train"]),
+                "val_loss": float(losses["val"]),
+                "lr": lr,
+            },
+            step=iter_num,
+        )
 
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
@@ -298,15 +294,14 @@ while True:
         )
 
     if iter_num % train_config.log_interval == 0 and master_process:
-        if wandb is not None:
-            wandb.log(
-                {
-                    "iter_loss": lossf,
-                    "iter_time_ms": dt * 1000.0,
-                    "lr": lr,
-                },
-                step=iter_num,
-            )
+        wandb.log(
+            {
+                "iter_loss": lossf,
+                "iter_time_ms": dt * 1000.0,
+                "lr": lr,
+            },
+            step=iter_num,
+        )
         log_message(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms")
 
     iter_num += 1
@@ -319,5 +314,5 @@ if ddp:
     destroy_process_group()
 if pbar is not None:
     pbar.close()
-if master_process and wandb is not None:
+if master_process:
     wandb.finish()
