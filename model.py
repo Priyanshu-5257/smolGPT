@@ -231,6 +231,12 @@ class SharedFFNCore(nn.Module):
         self.w1 = nn.Parameter(torch.empty(hidden_dim, config.n_embed))
         self.w2 = nn.Parameter(torch.empty(config.n_embed, hidden_dim))
         self.w3 = nn.Parameter(torch.empty(hidden_dim, config.n_embed))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.w1, mean=0.0, std=0.02)
+        nn.init.normal_(self.w2, mean=0.0, std=0.02)
+        nn.init.normal_(self.w3, mean=0.0, std=0.02)
 
 
 class SharedLowRankFeedForward(nn.Module):
