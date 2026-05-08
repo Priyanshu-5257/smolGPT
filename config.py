@@ -18,6 +18,10 @@ class GPTConfig:
     use_exclusive_self_attention: bool = True  # Remove self-reinforcing value component via learnable gate
     exclusive_self_attention_eps: float = 1e-8
     use_gradient_checkpointing: bool = True  # Save memory during training
+    use_shared_middle_mlp: bool = True  # Keep first/last MLP full, share middle MLP base + low-rank deltas
+    shared_mlp_rank: int = 16
+    shared_mlp_alpha: float = 1.0
+    shared_mlp_init_zero: bool = True
 
 
 # Pre-configured model sizes optimized for different VRAM budgets

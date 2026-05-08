@@ -1,11 +1,15 @@
 from model import GPT
 from config import GPTConfig, TrainingConfig, TrainConfigs
 from functools import partial
+import sys
 import time
 import math
 import os
 import torch
-import wandb
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 from tqdm import tqdm
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -17,6 +21,10 @@ if model_size:
     gpt_config, train_config = TrainConfigs.for_model_size(model_size)
 else:
     gpt_config, train_config = GPTConfig(), TrainingConfig()
+
+max_iters_override = os.getenv("MAX_ITERS")
+if max_iters_override:
+    train_config.max_iters = int(max_iters_override)
 
 out_dir = "out/"
 resume = False
@@ -84,9 +92,13 @@ model_args = dict(
     use_rotary=gpt_config.use_rotary,
     use_qk_norm=gpt_config.use_qk_norm,
     use_gradient_checkpointing=gpt_config.use_gradient_checkpointing,
+    use_shared_middle_mlp=gpt_config.use_shared_middle_mlp,
+    shared_mlp_rank=gpt_config.shared_mlp_rank,
+    shared_mlp_alpha=gpt_config.shared_mlp_alpha,
+    shared_mlp_init_zero=gpt_config.shared_mlp_init_zero,
 )
 
-if master_process:
+if master_process and wandb is not None:
     wandb.init(
         project=os.getenv("WANDB_PROJECT", "smolGPT"),
         name=os.getenv("WANDB_RUN_NAME"),
@@ -134,6 +146,9 @@ optimizer = model.configure_optimizers(
     train_config.device,
     optimizer_offload=train_config.optimizer_offload,
 )
+
+if sys.version_info >= (3, 13):
+    train_config.compile = False
 
 if train_config.compile:
     model = torch.compile(model)
@@ -215,14 +230,15 @@ while True:
         log_message(
             f"step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}"
         )
-        wandb.log(
-            {
-                "train_loss": float(losses["train"]),
-                "val_loss": float(losses["val"]),
-                "lr": lr,
-            },
-            step=iter_num,
-        )
+        if wandb is not None:
+            wandb.log(
+                {
+                    "train_loss": float(losses["train"]),
+                    "val_loss": float(losses["val"]),
+                    "lr": lr,
+                },
+                step=iter_num,
+            )
 
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
@@ -282,14 +298,15 @@ while True:
         )
 
     if iter_num % train_config.log_interval == 0 and master_process:
-        wandb.log(
-            {
-                "iter_loss": lossf,
-                "iter_time_ms": dt * 1000.0,
-                "lr": lr,
-            },
-            step=iter_num,
-        )
+        if wandb is not None:
+            wandb.log(
+                {
+                    "iter_loss": lossf,
+                    "iter_time_ms": dt * 1000.0,
+                    "lr": lr,
+                },
+                step=iter_num,
+            )
         log_message(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms")
 
     iter_num += 1
@@ -302,5 +319,5 @@ if ddp:
     destroy_process_group()
 if pbar is not None:
     pbar.close()
-if master_process:
+if master_process and wandb is not None:
     wandb.finish()

@@ -222,13 +222,96 @@ class FeedForward(nn.Module):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
+class SharedFFNCore(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = 4 * config.n_embed
+        hidden_dim = int(2 * hidden_dim / 3)
+        self.hidden_dim = hidden_dim
+        self.w1 = nn.Parameter(torch.empty(hidden_dim, config.n_embed))
+        self.w2 = nn.Parameter(torch.empty(config.n_embed, hidden_dim))
+        self.w3 = nn.Parameter(torch.empty(hidden_dim, config.n_embed))
+
+
+class SharedLowRankFeedForward(nn.Module):
+    def __init__(self, config, shared_core: SharedFFNCore):
+        super().__init__()
+        self.shared_core = shared_core
+        self.rank = config.shared_mlp_rank
+        self.alpha = config.shared_mlp_alpha
+        self.scaling = self.alpha / max(1, self.rank)
+
+        h = shared_core.hidden_dim
+        d = config.n_embed
+        r = self.rank
+
+        # Delta W = B @ A, where base weight shape is [out, in]
+        self.w1_A = nn.Parameter(torch.empty(r, d))
+        self.w1_B = nn.Parameter(torch.empty(h, r))
+
+        self.w2_A = nn.Parameter(torch.empty(r, h))
+        self.w2_B = nn.Parameter(torch.empty(d, r))
+
+        self.w3_A = nn.Parameter(torch.empty(r, d))
+        self.w3_B = nn.Parameter(torch.empty(h, r))
+
+        self.dropout = nn.Dropout(config.dropout)
+        self.init_zero = config.shared_mlp_init_zero
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.w1_A, mean=0.0, std=0.02)
+        nn.init.normal_(self.w2_A, mean=0.0, std=0.02)
+        nn.init.normal_(self.w3_A, mean=0.0, std=0.02)
+        if self.init_zero:
+            nn.init.zeros_(self.w1_B)
+            nn.init.zeros_(self.w2_B)
+            nn.init.zeros_(self.w3_B)
+        else:
+            nn.init.normal_(self.w1_B, mean=0.0, std=0.02)
+            nn.init.normal_(self.w2_B, mean=0.0, std=0.02)
+            nn.init.normal_(self.w3_B, mean=0.0, std=0.02)
+
+    def _delta_linear(self, x, A, B):
+        # x @ A^T -> rank, then rank @ B^T -> out
+        return F.linear(F.linear(x, A), B) * self.scaling
+
+    def forward(self, x):
+        w1_out = F.linear(x, self.shared_core.w1) + self._delta_linear(
+            x, self.w1_A, self.w1_B
+        )
+        w3_out = F.linear(x, self.shared_core.w3) + self._delta_linear(
+            x, self.w3_A, self.w3_B
+        )
+        gated = F.silu(w1_out) * w3_out
+        w2_out = F.linear(gated, self.shared_core.w2) + self._delta_linear(
+            gated, self.w2_A, self.w2_B
+        )
+        return self.dropout(w2_out)
+
+
 class Block(nn.Module):
-    def __init__(self, config, use_gradient_checkpointing=False):
+    def __init__(
+        self,
+        config,
+        layer_idx,
+        shared_ffn_core=None,
+        use_gradient_checkpointing=False,
+    ):
         super().__init__()
         self.ln_1 = nn.RMSNorm(config.n_embed)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.RMSNorm(config.n_embed)
-        self.ffd = FeedForward(config)
+        use_shared_middle = (
+            config.use_shared_middle_mlp
+            and shared_ffn_core is not None
+            and layer_idx > 0
+            and layer_idx < (config.n_layer - 1)
+        )
+        if use_shared_middle:
+            self.ffd = SharedLowRankFeedForward(config, shared_ffn_core)
+        else:
+            self.ffd = FeedForward(config)
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def forward(self, x):
@@ -258,13 +341,19 @@ class GPT(nn.Module):
         self.config = config
 
         # Create base transformer components
+        shared_ffn_core = SharedFFNCore(config) if config.use_shared_middle_mlp else None
         transformer_dict = {
             "wte": nn.Embedding(config.vocab_size, config.n_embed),
             "drop": nn.Dropout(config.dropout),
             "h": nn.ModuleList(
                 [
-                    Block(config, config.use_gradient_checkpointing)
-                    for _ in range(config.n_layer)
+                    Block(
+                        config,
+                        layer_idx=i,
+                        shared_ffn_core=shared_ffn_core,
+                        use_gradient_checkpointing=config.use_gradient_checkpointing,
+                    )
+                    for i in range(config.n_layer)
                 ]
             ),
             "ln_f": nn.RMSNorm(config.n_embed),
