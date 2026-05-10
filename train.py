@@ -23,7 +23,7 @@ max_iters_override = os.getenv("MAX_ITERS")
 if max_iters_override:
     train_config.max_iters = int(max_iters_override)
 
-out_dir = "out/"
+out_dir = os.getenv("OUT_DIR", "out/")
 resume = False
 ddp = int(os.environ.get("RANK", -1)) != -1
 tokenizer = Tokenizer(f"data/tok{gpt_config.vocab_size}.model")
