@@ -67,6 +67,7 @@ class TrainingConfig:
     eval_iters: int = 200
     gradient_accumulation_steps: int = 8
     batch_size: int = 8  # Smaller batch for larger models
+    num_workers: int = 8
 
     device: str = str(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     dtype: str = "bfloat16"  # Options: "bfloat16", "float16", "float32"

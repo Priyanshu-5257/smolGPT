@@ -112,7 +112,7 @@ iter_batches = partial(
     batch_size=train_config.batch_size,
     max_seq_len=gpt_config.block_size,
     device=train_config.device,
-    num_workers=0,
+    num_workers=train_config.num_workers,
 )
 
 best_val_loss = 1e9

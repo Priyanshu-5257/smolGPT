@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Run architecture-comparison training jobs for smolGPT.
 
-Designed for a single 16GB Tesla T4-style GPU. It runs a shared-middle-MLP
-model, a vanilla model with the exact same shape, and several vanilla
-parameter-matched baselines.
+Designed for a single larger GPU server: about 10 CPU cores, 60GB RAM, and
+48GB GPU VRAM. It runs a shared-middle-MLP model, a vanilla model with the
+exact same shape, and several vanilla parameter-matched baselines.
 
 Example:
     conda run -n basics python run_architecture_comparison.py --dry-run
-    conda run -n basics python run_architecture_comparison.py --max-iters 15000
+    conda run -n basics python run_architecture_comparison.py --max-iters 30000
     conda run -n basics python run_architecture_comparison.py --only shared_large vanilla_fewer_layers_match
 """
 
@@ -169,10 +169,11 @@ def run_experiment(exp: Experiment, args, target_params: int) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_overrides = {
-        # Safe defaults for a 16GB Tesla T4-style GPU.
+        # Aggressive defaults for a single 48GB VRAM GPU, 10 CPU cores, 60GB RAM.
         "max_iters": args.max_iters,
         "batch_size": args.batch_size,
         "gradient_accumulation_steps": args.grad_accum,
+        "num_workers": args.num_workers,
         "dtype": args.dtype,
         "compile": args.compile,
         "eval_interval": args.eval_interval,
@@ -204,18 +205,19 @@ def run_experiment(exp: Experiment, args, target_params: int) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-iters", type=int, default=15000)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--max-iters", type=int, default=30000)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--optimizer-offload", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--learning-rate", type=float, default=6e-4)
     parser.add_argument("--min-lr", type=float, default=6e-5)
-    parser.add_argument("--warmup-iters", type=int, default=1000)
+    parser.add_argument("--warmup-iters", type=int, default=2000)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--eval-start-iter", type=int, default=500)
-    parser.add_argument("--eval-iters", type=int, default=100)
+    parser.add_argument("--eval-iters", type=int, default=200)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--wandb-project", default="smolGPT")
     parser.add_argument("--wandb-group", default="architecture-comparison-shared-middle-mlp")
@@ -240,9 +242,15 @@ def main():
         raise SystemExit("No experiments selected")
 
     target_params = count_params(make_gpt_config(EXPERIMENTS[0]))
+    block_size = make_gpt_config(EXPERIMENTS[0]).block_size
+    tokens_per_iter = args.batch_size * args.grad_accum * block_size
     print(f"Target params from {EXPERIMENTS[0].key}: {target_params:,}")
     print(f"Selected experiments: {', '.join(exp.key for exp in selected)}")
-    print(f"Training dtype: {args.dtype}; batch_size={args.batch_size}; grad_accum={args.grad_accum}")
+    print(
+        f"Training dtype: {args.dtype}; batch_size={args.batch_size}; "
+        f"grad_accum={args.grad_accum}; num_workers={args.num_workers}; "
+        f"tokens_per_iter={tokens_per_iter:,}"
+    )
 
     for exp in selected:
         run_experiment(exp, args, target_params)
