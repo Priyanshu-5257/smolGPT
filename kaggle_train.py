@@ -37,7 +37,8 @@ def parse_args():
     parser.add_argument("--max-iters", type=int, default=3750)
     parser.add_argument("--warmup-iters", type=int, default=250)
     parser.add_argument("--batch-size", type=int, default=64, help="Per GPU")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    # Must be divisible by nproc_per_node (2 T4s). train.py splits this across ranks.
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--eval-iters", type=int, default=13)
     parser.add_argument("--prepare-data", action="store_true")
@@ -117,8 +118,14 @@ def run_variant(variant: str, args) -> None:
 
 def main():
     args = parse_args()
+    nproc_per_node = 2
     if args.batch_size < 1 or args.gradient_accumulation_steps < 1:
         raise ValueError("batch size and gradient accumulation steps must be positive")
+    if args.gradient_accumulation_steps % nproc_per_node != 0:
+        raise ValueError(
+            f"gradient accumulation steps ({args.gradient_accumulation_steps}) "
+            f"must be divisible by nproc_per_node ({nproc_per_node})"
+        )
 
     data_dir = validate_or_prepare_data(args.data_dir, args.prepare_data)
     expose_data_in_project(data_dir)

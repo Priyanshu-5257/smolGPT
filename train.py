@@ -71,6 +71,13 @@ if ddp:
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0
     seed_offset = ddp_rank
+    # Keep global batch size fixed: split accumulation across ranks.
+    if train_config.gradient_accumulation_steps % ddp_world_size != 0:
+        raise ValueError(
+            "gradient_accumulation_steps "
+            f"({train_config.gradient_accumulation_steps}) must be divisible by "
+            f"DDP world size ({ddp_world_size})"
+        )
     train_config.gradient_accumulation_steps //= ddp_world_size
 
 else:
