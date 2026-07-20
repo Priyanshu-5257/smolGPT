@@ -61,6 +61,32 @@ python preprocess.py prepare-dataset --vocab-size 4096
 python train.py
 ```
 
+To train the conditional-depth variant, set `MODEL_VARIANT=routed_mlp`.
+It runs attention in every layer, but routes each sequence through or around
+eligible MLP residuals; the central 20% of layers and final layer always keep
+their MLPs.
+
+```bash
+MODEL_VARIANT=routed_mlp python train.py
+```
+
+Routing defaults are in `GPTConfig`: `target_mlp_rate=0.50`,
+`router_aux_weight=0.01`, and `router_hidden=16`.
+
+### Kaggle 2x T4 comparison run
+
+Attach a Kaggle dataset containing the prepared `tok4096.model` and
+`TinyStories_all_data/*.bin` files, then run both DDP experiments sequentially
+with both T4 GPUs:
+
+```bash
+python kaggle_train.py --data-dir /kaggle/input/smolgpt-data
+```
+
+The default settings use FP16, a per-GPU batch size of 64, and retain the
+original large-model token budget while writing outputs to
+`/kaggle/working/smolgpt-out`.
+
 *Training and validation metrics are logged to Weights & Biases (W&B). To run online:*
 ```bash
 wandb login

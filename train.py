@@ -1,5 +1,6 @@
 from model import GPT
 from config import GPTConfig, TrainingConfig, TrainConfigs
+from dataclasses import asdict
 from functools import partial
 import time
 import math
@@ -18,7 +19,45 @@ if model_size:
 else:
     gpt_config, train_config = GPTConfig(), TrainingConfig()
 
-out_dir = "out/"
+model_variant = os.getenv("MODEL_VARIANT", "vanilla").lower()
+if model_variant not in {"vanilla", "routed_mlp"}:
+    raise ValueError("MODEL_VARIANT must be either 'vanilla' or 'routed_mlp'")
+if model_variant == "routed_mlp":
+    gpt_config.use_routed_mlp = True
+
+max_iters_override = os.getenv("MAX_ITERS")
+if max_iters_override is not None:
+    train_config.max_iters = int(max_iters_override)
+batch_size_override = os.getenv("BATCH_SIZE")
+if batch_size_override is not None:
+    train_config.batch_size = int(batch_size_override)
+grad_accumulation_override = os.getenv(
+    "TRAIN_GRADIENT_ACCUMULATION_STEPS",
+    os.getenv("GRAD_ACCUMULATION_STEPS"),
+)
+if grad_accumulation_override is not None:
+    train_config.gradient_accumulation_steps = int(grad_accumulation_override)
+dtype_override = os.getenv("TRAIN_DTYPE")
+if dtype_override is not None:
+    if dtype_override not in {"float16", "bfloat16", "float32"}:
+        raise ValueError("TRAIN_DTYPE must be float16, bfloat16, or float32")
+    train_config.dtype = dtype_override
+for environment_name, config_name in (
+    ("TRAIN_WARMUP_ITERS", "warmup_iters"),
+    ("TRAIN_LR_DECAY_ITERS", "lr_decay_iters"),
+    ("TRAIN_EVAL_INTERVAL", "eval_interval"),
+    ("TRAIN_EVAL_START_ITER", "eval_start_iter"),
+    ("TRAIN_EVAL_ITERS", "eval_iters"),
+):
+    override = os.getenv(environment_name)
+    if override is not None:
+        setattr(train_config, config_name, int(override))
+if train_config.batch_size < 1:
+    raise ValueError("BATCH_SIZE must be at least 1")
+if train_config.gradient_accumulation_steps < 1:
+    raise ValueError("gradient accumulation steps must be at least 1")
+
+out_dir = os.getenv("OUT_DIR", "out/")
 resume = False
 ddp = int(os.environ.get("RANK", -1)) != -1
 tokenizer = Tokenizer(f"data/tok{gpt_config.vocab_size}.model")
@@ -47,8 +86,14 @@ tokens_per_iter = (
 )
 if master_process:
     print("Tokens per iteration: ", tokens_per_iter)
+    print(
+        "Batch configuration: "
+        f"batch_size={train_config.batch_size}, "
+        f"gradient_accumulation_steps={train_config.gradient_accumulation_steps}"
+    )
     if model_size:
         print(f"Using model preset: {model_size.lower()}")
+    print(f"Using model variant: {model_variant}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -72,19 +117,7 @@ ctx = torch.autocast(train_config.device, dtype=dtype)
 if master_process:
     print(f"Using dtype: {train_config.dtype}, GradScaler: {scaler_enabled}")
 
-model_args = dict(
-    n_layer=gpt_config.n_layer,
-    n_head=gpt_config.n_head,
-    n_kv_head=gpt_config.n_kv_head,
-    n_embed=gpt_config.n_embed,
-    block_size=gpt_config.block_size,
-    bias=gpt_config.bias,
-    vocab_size=gpt_config.vocab_size,
-    dropout=gpt_config.dropout,
-    use_rotary=gpt_config.use_rotary,
-    use_qk_norm=gpt_config.use_qk_norm,
-    use_gradient_checkpointing=gpt_config.use_gradient_checkpointing,
-)
+model_args = asdict(gpt_config)
 
 if master_process:
     wandb.init(
@@ -146,18 +179,40 @@ if ddp:
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    validation_route_stats = None
     model.eval()
     for split in ["train", "val"]:
         losses = torch.zeros(train_config.eval_iters)
+        route_probabilities = []
+        route_choices = []
+        route_aux_losses = []
+        per_layer_choices = {}
         batch_iter = iter_batches(split=split)
         for k in range(train_config.eval_iters):
             X, Y = next(batch_iter)
             with ctx:
                 _, loss = raw_model(X, Y)
             losses[k] = loss.item()
+            if gpt_config.use_routed_mlp:
+                stats = raw_model.last_route_stats
+                route_probabilities.append(stats["mlp_probability"])
+                route_choices.append(stats["mlp_selected"])
+                route_aux_losses.append(stats["router_aux_loss"])
+                for layer, choice in stats["per_layer_selected"].items():
+                    per_layer_choices.setdefault(layer, []).append(choice)
         out[split] = losses.mean()
+        if route_probabilities and split == "val":
+            validation_route_stats = {
+                "mlp_probability": torch.stack(route_probabilities).mean(),
+                "mlp_selected": torch.stack(route_choices).mean(),
+                "router_aux_loss": torch.stack(route_aux_losses).mean(),
+                "per_layer_selected": {
+                    layer: torch.stack(choices).mean()
+                    for layer, choices in per_layer_choices.items()
+                },
+            }
     model.train()
-    return out
+    return out, validation_route_stats
 
 
 def get_lr(it):
@@ -180,6 +235,9 @@ if master_process:
 
 train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)
+
+if train_config.device.startswith("cuda"):
+    torch.cuda.reset_peak_memory_stats()
 
 iter_num = 0
 raw_model = model.module if ddp else model
@@ -211,18 +269,32 @@ while True:
         and iter_num % train_config.eval_interval == 0
         and master_process
     ):
-        losses = estimate_loss()
-        log_message(
-            f"step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}"
-        )
-        wandb.log(
-            {
-                "train_loss": float(losses["train"]),
-                "val_loss": float(losses["val"]),
-                "lr": lr,
-            },
-            step=iter_num,
-        )
+        losses, route_stats = estimate_loss()
+        message = f"step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}"
+        metrics = {
+            "train_loss": float(losses["train"]),
+            "val_loss": float(losses["val"]),
+            "lr": lr,
+        }
+        if route_stats is not None:
+            per_layer = ", ".join(
+                f"{layer}:{rate.item():.0%}"
+                for layer, rate in route_stats["per_layer_selected"].items()
+            )
+            message += (
+                f", routed_mlp_selected {route_stats['mlp_selected'].item():.2%}"
+                f", routed_mlp_probability {route_stats['mlp_probability'].item():.2%}"
+                f", layers [{per_layer}]"
+            )
+            metrics.update(
+                {
+                    "routed_mlp_selected": route_stats["mlp_selected"].item(),
+                    "routed_mlp_probability": route_stats["mlp_probability"].item(),
+                    "router_aux_loss": route_stats["router_aux_loss"].item(),
+                }
+            )
+        log_message(message)
+        wandb.log(metrics, step=iter_num)
 
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
@@ -282,15 +354,18 @@ while True:
         )
 
     if iter_num % train_config.log_interval == 0 and master_process:
-        wandb.log(
-            {
-                "iter_loss": lossf,
-                "iter_time_ms": dt * 1000.0,
-                "lr": lr,
-            },
-            step=iter_num,
-        )
-        log_message(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms")
+        metrics = {
+            "iter_loss": lossf,
+            "iter_time_ms": dt * 1000.0,
+            "lr": lr,
+        }
+        message = f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms"
+        if train_config.device.startswith("cuda"):
+            peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
+            metrics["gpu_peak_memory_gb"] = peak_memory_gb
+            message += f", peak GPU memory {peak_memory_gb:.2f} GB"
+        wandb.log(metrics, step=iter_num)
+        log_message(message)
 
     iter_num += 1
 

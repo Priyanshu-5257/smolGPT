@@ -222,28 +222,65 @@ class FeedForward(nn.Module):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
+class MLPRouter(nn.Module):
+    """Choose once per sequence whether an MLP residual should run."""
+
+    def __init__(self, width, hidden_width):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(width, hidden_width), nn.Tanh(), nn.Linear(hidden_width, 2)
+        )
+
+    def forward(self, x):
+        logits = self.net(x.mean(dim=1))
+        mlp_probability = F.softmax(logits, dim=-1)[:, 1]
+        if self.training:
+            # A hard choice in the forward pass with soft straight-through
+            # gradients lets the router learn from the language-model loss.
+            apply_mlp = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)[:, 1]
+        else:
+            apply_mlp = (mlp_probability >= 0.5).to(x.dtype)
+        return apply_mlp, mlp_probability
+
+
 class Block(nn.Module):
-    def __init__(self, config, use_gradient_checkpointing=False):
+    def __init__(self, config, route_mlp=False):
         super().__init__()
         self.ln_1 = nn.RMSNorm(config.n_embed)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.RMSNorm(config.n_embed)
         self.ffd = FeedForward(config)
-        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_gradient_checkpointing = config.use_gradient_checkpointing
+        self.router = (
+            MLPRouter(config.n_embed, config.router_hidden) if route_mlp else None
+        )
 
     def forward(self, x):
-        if self.use_gradient_checkpointing:
+        if self.use_gradient_checkpointing and self.training:
             # Memory-efficient: recompute forward during backward
             x = x + torch.utils.checkpoint.checkpoint(
                 self._attn_wrapper, self.ln_1(x), use_reentrant=False
             )
-            x = x + torch.utils.checkpoint.checkpoint(
-                self._ffn_wrapper, self.ln_2(x), use_reentrant=False
-            )
         else:
             x = x + self.attn(self.ln_1(x))
-            x = x + self.ffd(self.ln_2(x))
-        return x
+
+        normalized = self.ln_2(x)
+        if self.router is None:
+            if self.use_gradient_checkpointing and self.training:
+                update = torch.utils.checkpoint.checkpoint(
+                    self._ffn_wrapper, normalized, use_reentrant=False
+                )
+            else:
+                update = self.ffd(normalized)
+            return x + update, None, None
+
+        if self.use_gradient_checkpointing and self.training:
+            update, probability, choice = torch.utils.checkpoint.checkpoint(
+                self._routed_ffn_wrapper, normalized, use_reentrant=False
+            )
+        else:
+            update, probability, choice = self._routed_ffn_wrapper(normalized)
+        return x + update, probability, choice
 
     def _attn_wrapper(self, x):
         return self.attn(x)
@@ -251,11 +288,54 @@ class Block(nn.Module):
     def _ffn_wrapper(self, x):
         return self.ffd(x)
 
+    def _routed_ffn_wrapper(self, x):
+        apply_mlp, mlp_probability = self.router(x)
+        if self.training:
+            # Training computes every MLP so straight-through routing receives a
+            # useful gradient. In evaluation/generation, skipped sequences avoid it.
+            update = self.ffd(x)
+        else:
+            update = torch.zeros_like(x)
+            selected = apply_mlp.bool()
+            if selected.any():
+                # Under mixed precision, the residual stream can be float32
+                # while the MLP output is BF16. Cast before indexed assignment.
+                update[selected] = self.ffd(x[selected]).to(update.dtype)
+        return (
+            apply_mlp[:, None, None] * update,
+            mlp_probability,
+            apply_mlp.detach().mean(),
+        )
+
+
+def always_on_mlp_layers(layer_count, middle_fraction):
+    """Return the protected central span and final layer for routed MLPs."""
+    if not 0.0 <= middle_fraction <= 1.0:
+        raise ValueError("middle_mlp_fraction must be in [0, 1]")
+    middle_count = max(1, round(layer_count * middle_fraction))
+    middle_count = min(layer_count, middle_count)
+    middle_start = (layer_count - middle_count) // 2
+    protected = set(range(middle_start, middle_start + middle_count))
+    protected.add(layer_count - 1)
+    return protected
+
 
 class GPT(nn.Module):
     def __init__(self, config, use_gradient_checkpointing=False):
         super().__init__()
         self.config = config
+
+        if config.router_hidden < 1:
+            raise ValueError("router_hidden must be at least 1")
+        if not 0.0 <= config.target_mlp_rate <= 1.0:
+            raise ValueError("target_mlp_rate must be in [0, 1]")
+
+        protected_layers = (
+            always_on_mlp_layers(config.n_layer, config.middle_mlp_fraction)
+            if config.use_routed_mlp
+            else set()
+        )
+        self.always_on_mlp_layers = tuple(sorted(protected_layers))
 
         # Create base transformer components
         transformer_dict = {
@@ -263,8 +343,12 @@ class GPT(nn.Module):
             "drop": nn.Dropout(config.dropout),
             "h": nn.ModuleList(
                 [
-                    Block(config, config.use_gradient_checkpointing)
-                    for _ in range(config.n_layer)
+                    Block(
+                        config,
+                        route_mlp=config.use_routed_mlp
+                        and layer_index not in protected_layers,
+                    )
+                    for layer_index in range(config.n_layer)
                 ]
             ),
             "ln_f": nn.RMSNorm(config.n_embed),
@@ -279,6 +363,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
         self.transformer.wte.weight = self.lm_head.weight
+        self.last_route_stats = {}
 
         self.apply(self._init_weights)
 
@@ -308,15 +393,41 @@ class GPT(nn.Module):
             )
             x = x + pos_emb
 
-        for block in self.transformer.h:
-            x = block(x)
+        route_probabilities = []
+        route_choices = []
+        routed_layer_indices = []
+        for layer_index, block in enumerate(self.transformer.h):
+            x, probability, choice = block(x)
+            if probability is not None:
+                route_probabilities.append(probability)
+                route_choices.append(choice)
+                routed_layer_indices.append(layer_index)
         x = self.transformer.ln_f(x)
+
+        if route_probabilities:
+            route_probability = torch.stack(route_probabilities).mean()
+            route_choice = torch.stack(route_choices).mean()
+            router_aux_loss = (route_probability - self.config.target_mlp_rate).square()
+        else:
+            route_probability = x.new_tensor(1.0)
+            route_choice = x.new_tensor(1.0)
+            router_aux_loss = x.new_zeros(())
+        self.last_route_stats = {
+            "mlp_probability": route_probability.detach(),
+            "mlp_selected": route_choice.detach(),
+            "router_aux_loss": router_aux_loss.detach(),
+            "per_layer_selected": {
+                layer_index: choice.detach()
+                for layer_index, choice in zip(routed_layer_indices, route_choices)
+            },
+        }
 
         if targets is not None:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(
+            token_loss = F.cross_entropy(
                 logits.view(-1, logits.shape[-1]), targets.view(-1), ignore_index=-1
             )
+            loss = token_loss + self.config.router_aux_weight * router_aux_loss
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None

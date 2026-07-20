@@ -18,6 +18,13 @@ class GPTConfig:
     use_exclusive_self_attention: bool = True  # Remove self-reinforcing value component via learnable gate
     exclusive_self_attention_eps: float = 1e-8
     use_gradient_checkpointing: bool = True  # Save memory during training
+    # Mixture-of-depth routing: attention always runs, while eligible MLP
+    # residuals are conditionally applied once per sequence.
+    use_routed_mlp: bool = False
+    middle_mlp_fraction: float = 0.20
+    target_mlp_rate: float = 0.50
+    router_aux_weight: float = 0.01
+    router_hidden: int = 16
 
 
 # Pre-configured model sizes optimized for different VRAM budgets
