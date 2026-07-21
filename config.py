@@ -22,9 +22,12 @@ class GPTConfig:
     # residuals are conditionally applied once per sequence.
     use_routed_mlp: bool = False
     middle_mlp_fraction: float = 0.20
-    target_mlp_rate: float = 0.50
-    router_aux_weight: float = 0.01
+    # Target fraction of sequences that run each routed MLP (with headroom under 50%).
+    target_mlp_rate: float = 0.40
+    router_aux_weight: float = 0.1
     router_hidden: int = 16
+    # Hard per-layer top-k so selection cannot exceed target_mlp_rate when batch > 1.
+    enforce_router_capacity: bool = True
 
 
 # Pre-configured model sizes optimized for different VRAM budgets

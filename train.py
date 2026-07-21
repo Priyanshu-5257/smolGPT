@@ -25,6 +25,21 @@ if model_variant not in {"vanilla", "routed_mlp"}:
 if model_variant == "routed_mlp":
     gpt_config.use_routed_mlp = True
 
+target_mlp_rate_override = os.getenv("TARGET_MLP_RATE")
+if target_mlp_rate_override is not None:
+    gpt_config.target_mlp_rate = float(target_mlp_rate_override)
+router_aux_weight_override = os.getenv("ROUTER_AUX_WEIGHT")
+if router_aux_weight_override is not None:
+    gpt_config.router_aux_weight = float(router_aux_weight_override)
+enforce_capacity_override = os.getenv("ENFORCE_ROUTER_CAPACITY")
+if enforce_capacity_override is not None:
+    gpt_config.enforce_router_capacity = enforce_capacity_override.lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 max_iters_override = os.getenv("MAX_ITERS")
 if max_iters_override is not None:
     train_config.max_iters = int(max_iters_override)
@@ -56,6 +71,10 @@ if train_config.batch_size < 1:
     raise ValueError("BATCH_SIZE must be at least 1")
 if train_config.gradient_accumulation_steps < 1:
     raise ValueError("gradient accumulation steps must be at least 1")
+if not 0.0 <= gpt_config.target_mlp_rate <= 1.0:
+    raise ValueError("TARGET_MLP_RATE must be in [0, 1]")
+if gpt_config.router_aux_weight < 0.0:
+    raise ValueError("ROUTER_AUX_WEIGHT must be non-negative")
 
 out_dir = os.getenv("OUT_DIR", "out/")
 resume = False
@@ -102,6 +121,13 @@ if master_process:
     if model_size:
         print(f"Using model preset: {model_size.lower()}")
     print(f"Using model variant: {model_variant}")
+    if gpt_config.use_routed_mlp:
+        print(
+            "Routed MLP: "
+            f"target_mlp_rate={gpt_config.target_mlp_rate:.2f}, "
+            f"router_aux_weight={gpt_config.router_aux_weight:.3f}, "
+            f"enforce_router_capacity={gpt_config.enforce_router_capacity}"
+        )
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -200,7 +226,11 @@ def estimate_loss():
             X, Y = next(batch_iter)
             with ctx:
                 _, loss = raw_model(X, Y)
-            losses[k] = loss.item()
+            # Report CE-only so routed and vanilla val_loss are comparable.
+            token_loss = getattr(raw_model, "last_token_loss", None)
+            losses[k] = (
+                token_loss.item() if token_loss is not None else loss.item()
+            )
             if gpt_config.use_routed_mlp:
                 stats = raw_model.last_route_stats
                 route_probabilities.append(stats["mlp_probability"])
@@ -210,14 +240,21 @@ def estimate_loss():
                     per_layer_choices.setdefault(layer, []).append(choice)
         out[split] = losses.mean()
         if route_probabilities and split == "val":
+            per_layer_selected = {
+                layer: torch.stack(choices).mean()
+                for layer, choices in per_layer_choices.items()
+            }
+            selected_rates = list(per_layer_selected.values())
             validation_route_stats = {
                 "mlp_probability": torch.stack(route_probabilities).mean(),
                 "mlp_selected": torch.stack(route_choices).mean(),
                 "router_aux_loss": torch.stack(route_aux_losses).mean(),
-                "per_layer_selected": {
-                    layer: torch.stack(choices).mean()
-                    for layer, choices in per_layer_choices.items()
-                },
+                "per_layer_selected": per_layer_selected,
+                "mlp_selected_max_layer": (
+                    torch.stack(selected_rates).max()
+                    if selected_rates
+                    else torch.tensor(0.0)
+                ),
             }
     model.train()
     return out, validation_route_stats
@@ -289,20 +326,29 @@ while True:
             if route_stats is not None:
                 per_layer = ", ".join(
                     f"{layer}:{rate.item():.0%}"
-                    for layer, rate in route_stats["per_layer_selected"].items()
+                    for layer, rate in sorted(
+                        route_stats["per_layer_selected"].items()
+                    )
                 )
+                max_layer_rate = route_stats["mlp_selected_max_layer"].item()
                 message += (
                     f", routed_mlp_selected {route_stats['mlp_selected'].item():.2%}"
                     f", routed_mlp_probability {route_stats['mlp_probability'].item():.2%}"
+                    f", routed_mlp_max_layer {max_layer_rate:.2%}"
                     f", layers [{per_layer}]"
                 )
                 metrics.update(
                     {
                         "routed_mlp_selected": route_stats["mlp_selected"].item(),
-                        "routed_mlp_probability": route_stats["mlp_probability"].item(),
+                        "routed_mlp_probability": route_stats[
+                            "mlp_probability"
+                        ].item(),
                         "router_aux_loss": route_stats["router_aux_loss"].item(),
+                        "routed_mlp_max_layer": max_layer_rate,
                     }
                 )
+                for layer, rate in route_stats["per_layer_selected"].items():
+                    metrics[f"routed_mlp_layer_{layer}"] = rate.item()
             log_message(message)
             wandb.log(metrics, step=iter_num)
 

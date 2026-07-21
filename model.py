@@ -222,6 +222,18 @@ class FeedForward(nn.Module):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
+def capacity_topk_mask(scores, target_rate):
+    """Keep at most floor(target_rate * B) sequences (at least 1 if B > 1)."""
+    batch = scores.shape[0]
+    if batch <= 1:
+        return None
+    k = min(batch, max(1, int(math.floor(target_rate * batch))))
+    topk = torch.topk(scores, k=k, largest=True).indices
+    hard = torch.zeros_like(scores)
+    hard[topk] = 1.0
+    return hard
+
+
 class MLPRouter(nn.Module):
     """Choose once per sequence whether an MLP residual should run."""
 
@@ -231,15 +243,29 @@ class MLPRouter(nn.Module):
             nn.Linear(width, hidden_width), nn.Tanh(), nn.Linear(hidden_width, 2)
         )
 
-    def forward(self, x):
+    def forward(self, x, target_rate=0.4, enforce_capacity=False):
         logits = self.net(x.mean(dim=1))
         mlp_probability = F.softmax(logits, dim=-1)[:, 1]
-        if self.training:
+        capacity_mask = (
+            capacity_topk_mask(mlp_probability, target_rate)
+            if enforce_capacity
+            else None
+        )
+        if capacity_mask is not None:
+            # Hard top-k forward; straight-through soft gradient through probs.
+            if self.training:
+                apply_mlp = capacity_mask + (
+                    mlp_probability - mlp_probability.detach()
+                )
+            else:
+                apply_mlp = capacity_mask
+        elif self.training:
             # A hard choice in the forward pass with soft straight-through
             # gradients lets the router learn from the language-model loss.
             apply_mlp = F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)[:, 1]
         else:
-            apply_mlp = (mlp_probability >= 0.5).to(x.dtype)
+            # B == 1 (e.g. generation): capacity is a no-op, use a threshold.
+            apply_mlp = (mlp_probability >= 0.5).to(dtype=mlp_probability.dtype)
         return apply_mlp, mlp_probability
 
 
@@ -251,6 +277,8 @@ class Block(nn.Module):
         self.ln_2 = nn.RMSNorm(config.n_embed)
         self.ffd = FeedForward(config)
         self.use_gradient_checkpointing = config.use_gradient_checkpointing
+        self.target_mlp_rate = config.target_mlp_rate
+        self.enforce_router_capacity = config.enforce_router_capacity
         self.router = (
             MLPRouter(config.n_embed, config.router_hidden) if route_mlp else None
         )
@@ -289,7 +317,11 @@ class Block(nn.Module):
         return self.ffd(x)
 
     def _routed_ffn_wrapper(self, x):
-        apply_mlp, mlp_probability = self.router(x)
+        apply_mlp, mlp_probability = self.router(
+            x,
+            target_rate=self.target_mlp_rate,
+            enforce_capacity=self.enforce_router_capacity,
+        )
         if self.training:
             # Training computes every MLP so straight-through routing receives a
             # useful gradient. In evaluation/generation, skipped sequences avoid it.
@@ -329,6 +361,8 @@ class GPT(nn.Module):
             raise ValueError("router_hidden must be at least 1")
         if not 0.0 <= config.target_mlp_rate <= 1.0:
             raise ValueError("target_mlp_rate must be in [0, 1]")
+        if config.router_aux_weight < 0.0:
+            raise ValueError("router_aux_weight must be non-negative")
 
         protected_layers = (
             always_on_mlp_layers(config.n_layer, config.middle_mlp_fraction)
@@ -405,21 +439,37 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if route_probabilities:
-            route_probability = torch.stack(route_probabilities).mean()
+            # Per-layer mean probability over the batch; one-sided overshoot penalty
+            # keeps each routed layer from drifting above the target rate.
+            per_layer_probs = torch.stack(
+                [probability.mean() for probability in route_probabilities]
+            )
+            route_probability = per_layer_probs.mean()
             route_choice = torch.stack(route_choices).mean()
-            router_aux_loss = (route_probability - self.config.target_mlp_rate).square()
+            target = self.config.target_mlp_rate
+            router_aux_loss = F.relu(per_layer_probs - target).square().mean()
+            per_layer_selected = {
+                layer_index: choice.detach()
+                for layer_index, choice in zip(routed_layer_indices, route_choices)
+            }
+            per_layer_probability = {
+                layer_index: probability.mean().detach()
+                for layer_index, probability in zip(
+                    routed_layer_indices, route_probabilities
+                )
+            }
         else:
             route_probability = x.new_tensor(1.0)
             route_choice = x.new_tensor(1.0)
             router_aux_loss = x.new_zeros(())
+            per_layer_selected = {}
+            per_layer_probability = {}
         self.last_route_stats = {
             "mlp_probability": route_probability.detach(),
             "mlp_selected": route_choice.detach(),
             "router_aux_loss": router_aux_loss.detach(),
-            "per_layer_selected": {
-                layer_index: choice.detach()
-                for layer_index, choice in zip(routed_layer_indices, route_choices)
-            },
+            "per_layer_selected": per_layer_selected,
+            "per_layer_probability": per_layer_probability,
         }
 
         if targets is not None:
@@ -427,10 +477,14 @@ class GPT(nn.Module):
             token_loss = F.cross_entropy(
                 logits.view(-1, logits.shape[-1]), targets.view(-1), ignore_index=-1
             )
+            # Keep CE separate so eval/logging can compare fairly with vanilla.
+            self.last_token_loss = token_loss.detach()
+            self.last_route_stats["token_loss"] = self.last_token_loss
             loss = token_loss + self.config.router_aux_weight * router_aux_loss
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
+            self.last_token_loss = None
         return logits, loss
 
     def configure_optimizers(

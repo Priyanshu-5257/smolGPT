@@ -41,6 +41,24 @@ def parse_args():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--eval-iters", type=int, default=13)
+    parser.add_argument(
+        "--target-mlp-rate",
+        type=float,
+        default=0.40,
+        help="Max fraction of sequences that run each routed MLP",
+    )
+    parser.add_argument(
+        "--router-aux-weight",
+        type=float,
+        default=0.1,
+        help="Weight on one-sided MLP-rate overshoot aux loss",
+    )
+    parser.add_argument(
+        "--enforce-router-capacity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Hard top-k capacity so selection cannot exceed --target-mlp-rate",
+    )
     parser.add_argument("--prepare-data", action="store_true")
     return parser.parse_args()
 
@@ -100,6 +118,11 @@ def run_variant(variant: str, args) -> None:
             "TRAIN_EVAL_INTERVAL": str(args.eval_interval),
             "TRAIN_EVAL_START_ITER": str(args.eval_interval),
             "TRAIN_EVAL_ITERS": str(args.eval_iters),
+            "TARGET_MLP_RATE": str(args.target_mlp_rate),
+            "ROUTER_AUX_WEIGHT": str(args.router_aux_weight),
+            "ENFORCE_ROUTER_CAPACITY": (
+                "1" if args.enforce_router_capacity else "0"
+            ),
             "WANDB_MODE": "offline",
             "WANDB_DIR": str(output_dir),
         }
@@ -121,6 +144,10 @@ def main():
     nproc_per_node = 2
     if args.batch_size < 1 or args.gradient_accumulation_steps < 1:
         raise ValueError("batch size and gradient accumulation steps must be positive")
+    if not 0.0 <= args.target_mlp_rate <= 1.0:
+        raise ValueError("target MLP rate must be in [0, 1]")
+    if args.router_aux_weight < 0.0:
+        raise ValueError("router aux weight must be non-negative")
     if args.gradient_accumulation_steps % nproc_per_node != 0:
         raise ValueError(
             f"gradient accumulation steps ({args.gradient_accumulation_steps}) "
@@ -129,7 +156,8 @@ def main():
 
     data_dir = validate_or_prepare_data(args.data_dir, args.prepare_data)
     expose_data_in_project(data_dir)
-    run_variant("vanilla", args)
+    # Vanilla already trained; only retrain the capacity-capped routed variant.
+    # run_variant("vanilla", args)
     run_variant("routed_mlp", args)
 
 
