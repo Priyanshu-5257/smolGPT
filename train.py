@@ -8,7 +8,7 @@ import os
 import torch
 import wandb
 from tqdm import tqdm
-from torch.distributed import destroy_process_group, init_process_group
+from torch.distributed import barrier, destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import Task
 from tokenizer import Tokenizer
@@ -69,6 +69,7 @@ if ddp:
     ddp_world_size = int(os.environ["WORLD_SIZE"])
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
+    train_config.device = device
     master_process = ddp_rank == 0
     seed_offset = ddp_rank
     # Keep global batch size fixed: split accumulation across ranks.
@@ -247,7 +248,9 @@ if train_config.device.startswith("cuda"):
     torch.cuda.reset_peak_memory_stats()
 
 iter_num = 0
+# DDP wraps the module; torch.compile wraps it again as OptimizedModule.
 raw_model = model.module if ddp else model
+base_model = getattr(raw_model, "_orig_mod", raw_model)
 t0 = time.time()
 total_steps = train_config.max_iters + 1
 pbar = (
@@ -274,56 +277,62 @@ while True:
     if (
         iter_num >= train_config.eval_start_iter
         and iter_num % train_config.eval_interval == 0
-        and master_process
     ):
-        losses, route_stats = estimate_loss()
-        message = f"step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}"
-        metrics = {
-            "train_loss": float(losses["train"]),
-            "val_loss": float(losses["val"]),
-            "lr": lr,
-        }
-        if route_stats is not None:
-            per_layer = ", ".join(
-                f"{layer}:{rate.item():.0%}"
-                for layer, rate in route_stats["per_layer_selected"].items()
-            )
-            message += (
-                f", routed_mlp_selected {route_stats['mlp_selected'].item():.2%}"
-                f", routed_mlp_probability {route_stats['mlp_probability'].item():.2%}"
-                f", layers [{per_layer}]"
-            )
-            metrics.update(
-                {
-                    "routed_mlp_selected": route_stats["mlp_selected"].item(),
-                    "routed_mlp_probability": route_stats["mlp_probability"].item(),
-                    "router_aux_loss": route_stats["router_aux_loss"].item(),
-                }
-            )
-        log_message(message)
-        wandb.log(metrics, step=iter_num)
-
-        if losses["val"] < best_val_loss:
-            best_val_loss = losses["val"]
-            checkpoint = {
-                "model": raw_model.state_dict(),
-                "model_args": model_args,
-                "iter_num": iter_num,
-                "best_val_loss": best_val_loss,
+        if master_process:
+            losses, route_stats = estimate_loss()
+            message = f"step {iter_num}: train_loss {losses['train']:.4f}, val_loss {losses['val']:.4f}"
+            metrics = {
+                "train_loss": float(losses["train"]),
+                "val_loss": float(losses["val"]),
+                "lr": lr,
             }
-            log_message(f"Saving checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-        model.eval()
-        prompt = "Once upon a time"
-        idxs = tokenizer.encode(prompt, bos=True, eos=False)
-        x = torch.tensor(idxs, dtype=torch.long, device=train_config.device).unsqueeze(
-            0
-        )
-        y = model.generate(x, max_new_tokens=256, temperature=1.0, top_p=0.90)
-        log_message(
-            "===\n\nGenerated Story:\n\n" + tokenizer.decode(y[0].tolist()) + "\n\n==="
-        )
-        model.train()
+            if route_stats is not None:
+                per_layer = ", ".join(
+                    f"{layer}:{rate.item():.0%}"
+                    for layer, rate in route_stats["per_layer_selected"].items()
+                )
+                message += (
+                    f", routed_mlp_selected {route_stats['mlp_selected'].item():.2%}"
+                    f", routed_mlp_probability {route_stats['mlp_probability'].item():.2%}"
+                    f", layers [{per_layer}]"
+                )
+                metrics.update(
+                    {
+                        "routed_mlp_selected": route_stats["mlp_selected"].item(),
+                        "routed_mlp_probability": route_stats["mlp_probability"].item(),
+                        "router_aux_loss": route_stats["router_aux_loss"].item(),
+                    }
+                )
+            log_message(message)
+            wandb.log(metrics, step=iter_num)
+
+            if losses["val"] < best_val_loss:
+                best_val_loss = losses["val"]
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "model_args": model_args,
+                    "iter_num": iter_num,
+                    "best_val_loss": best_val_loss,
+                }
+                log_message(f"Saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+            model.eval()
+            prompt = "Once upon a time"
+            idxs = tokenizer.encode(prompt, bos=True, eos=False)
+            x = torch.tensor(
+                idxs, dtype=torch.long, device=train_config.device
+            ).unsqueeze(0)
+            y = base_model.generate(
+                x, max_new_tokens=256, temperature=1.0, top_p=0.90
+            )
+            log_message(
+                "===\n\nGenerated Story:\n\n"
+                + tokenizer.decode(y[0].tolist())
+                + "\n\n==="
+            )
+            model.train()
+        if ddp:
+            barrier()
 
     for micro_step in range(train_config.gradient_accumulation_steps):
         if ddp:

@@ -9,6 +9,8 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 import sentencepiece as spm
 import glob
+import tarfile
+from contextlib import contextmanager
 
 from tokenizer import Tokenizer
 
@@ -16,12 +18,30 @@ DATA_CACHE_DIR = Path("data")
 DATA_CACHE_DIR.mkdir(exist_ok=True)
 
 
+@contextmanager
+def _silence_native_logs():
+    """Silence C/C++ logs written directly to stdout/stderr (e.g. SentencePiece)."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved_out = os.dup(1)
+    saved_err = os.dup(2)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    try:
+        yield
+    finally:
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
+        os.close(devnull)
+
+
 def download_file(url: str, filename: str, chunk_size: int = 1024) -> None:
     response = requests.get(url, stream=True)
     total = int(response.headers.get("content-length", 0))
 
     with open(filename, "wb") as f, tqdm(
-        desc=filename,
+        desc=os.path.basename(filename),
         total=total,
         unit="iB",
         unit_scale=True,
@@ -44,7 +64,9 @@ def download() -> None:
     if not data_dir.exists():
         data_dir.mkdir(exist_ok=True)
         print("Extracting TinyStories dataset...")
-        os.system(f"tar -xvf {data_filename} -C {data_dir}")
+        # Quiet extract (avoid listing every member — TinyStories has 1000+ files).
+        with tarfile.open(data_filename, "r:gz") as tar:
+            tar.extractall(path=data_dir)
 
 
 def train_vocab(vocab_size: int) -> None:
@@ -61,24 +83,27 @@ def train_vocab(vocab_size: int) -> None:
             for example in data:
                 f.write(example["story"].strip() + "\n")
 
-    spm.SentencePieceTrainer.train(
-        input=str(tiny_file),
-        model_prefix=str(prefix),
-        model_type="bpe",
-        vocab_size=vocab_size,
-        self_test_sample_size=0,
-        input_format="text",
-        num_threads=os.cpu_count(),
-        split_digits=True,
-        allow_whitespace_only_pieces=True,
-        byte_fallback=True,
-        unk_surface=r"\342\201\207 ",
-        normalization_rule_name="identity",
-    )
+    # SentencePiece writes glog INFO to the process stderr; silence at the FD level.
+    with _silence_native_logs():
+        spm.SentencePieceTrainer.train(
+            input=str(tiny_file),
+            model_prefix=str(prefix),
+            model_type="bpe",
+            vocab_size=vocab_size,
+            self_test_sample_size=0,
+            input_format="text",
+            num_threads=os.cpu_count(),
+            split_digits=True,
+            allow_whitespace_only_pieces=True,
+            byte_fallback=True,
+            unk_surface=r"\342\201\207 ",
+            normalization_rule_name="identity",
+            minloglevel=2,
+        )
 
 
-def process_shard(args: tuple, vocab_size: int) -> None:
-    shard_id, shard = args
+def process_shard(args: tuple, vocab_size: int) -> str:
+    _, shard = args
     tokenizer_model = DATA_CACHE_DIR / f"tok{vocab_size}.model"
     tokenizer = Tokenizer(str(tokenizer_model))
 
@@ -86,7 +111,7 @@ def process_shard(args: tuple, vocab_size: int) -> None:
         data = json.load(f)
 
     all_tokens = []
-    for example in tqdm(data, position=shard_id):
+    for example in data:
         text = example["story"].strip()
         tokens = tokenizer.encode(text, bos=True, eos=True)
         all_tokens.extend(tokens)
@@ -96,6 +121,7 @@ def process_shard(args: tuple, vocab_size: int) -> None:
 
     with open(tokenized_filename, "wb") as f:
         f.write(all_tokens.tobytes())
+    return tokenized_filename
 
 
 def pretokenize(vocab_size: int) -> None:
@@ -104,7 +130,14 @@ def pretokenize(vocab_size: int) -> None:
 
     func = partial(process_shard, vocab_size=vocab_size)
     with ProcessPoolExecutor() as executor:
-        executor.map(func, enumerate(shard_filenames))
+        # One progress bar over shards instead of per-example bars from every worker.
+        list(
+            tqdm(
+                executor.map(func, enumerate(shard_filenames)),
+                total=len(shard_filenames),
+                desc="Pretokenizing shards",
+            )
+        )
 
 
 def prepare_dataset(vocab_size: int) -> None:
